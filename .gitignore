@@ -1,0 +1,12 @@
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.exe
+*.cer
+*.pdb
+*.obj
+*.sys
+*.inf
+.vs/
+
+build/
