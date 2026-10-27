@@ -1,4 +1,5 @@
 #include <ntifs.h>
+#include <ntstrsafe.h>
 
 #include "../shared/protocol.h"
 
@@ -196,7 +197,7 @@ namespace driver {
 		}
 
 		UNICODE_STRING link = {};
-		RtlInitUnicodeString(&link, L"\\DosDevices\\io-driver");
+		RtlInitUnicodeString(&link, L"\\GLOBAL??\\io-driver");
 		IoDeleteSymbolicLink(&link);
 
 		if (driver_obj->DeviceObject != nullptr) {
@@ -209,8 +210,19 @@ namespace driver {
 
 NTSTATUS driver_main(PDRIVER_OBJECT driverobj, PUNICODE_STRING path) {
 	UNREFERENCED_PARAMETER(path);
+
+	UNICODE_STRING link = {};
+	RtlInitUnicodeString(&link, L"\\GLOBAL??\\io-driver");
+	IoDeleteSymbolicLink(&link);
+
+	LARGE_INTEGER ticks = {};
+	KeQueryTickCount(&ticks);
+	WCHAR dev_name_buf[64];
+	RtlStringCbPrintfW(dev_name_buf, sizeof(dev_name_buf),
+						L"\\Device\\io-driver-%llx", ticks.QuadPart);
+
 	UNICODE_STRING device_name = {};
-	RtlInitUnicodeString(&device_name, L"\\Device\\io-driver");
+	RtlInitUnicodeString(&device_name, dev_name_buf);
 	PDEVICE_OBJECT device_obj = nullptr;
 	NTSTATUS status = IoCreateDevice(driverobj, 0, &device_name, FILE_DEVICE_UNKNOWN,
 									FILE_DEVICE_SECURE_OPEN, FALSE, &device_obj);
@@ -220,9 +232,6 @@ NTSTATUS driver_main(PDRIVER_OBJECT driverobj, PUNICODE_STRING path) {
 	}
 
 	debug_print("driver device successfully created.\n");
-
-	UNICODE_STRING link = {};
-	RtlInitUnicodeString(&link, L"\\DosDevices\\io-driver");
 
 	status = IoCreateSymbolicLink(&link, &device_name);
 	if (status != STATUS_SUCCESS) {
@@ -251,5 +260,10 @@ NTSTATUS DriverEntry() {
 	UNICODE_STRING driver_name = {};
 	RtlInitUnicodeString(&driver_name, L"\\Driver\\io-driver");
 
-	return IoCreateDriver(&driver_name, &driver_main);
+	NTSTATUS status = IoCreateDriver(&driver_name, &driver_main);
+	if (status == STATUS_OBJECT_NAME_COLLISION) {
+		// Previous mapping left a stale driver object — use an anonymous one.
+		status = IoCreateDriver(nullptr, &driver_main);
+	}
+	return status;
 }
