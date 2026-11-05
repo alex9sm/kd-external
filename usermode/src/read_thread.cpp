@@ -60,67 +60,138 @@ void read_thread_func(SharedState& state) {
 	constexpr size_t   PAWN_BUF_SIZE   = (OFF_V_OLD_ORIGIN + sizeof(vec3)) - PAWN_READ_START;
 
 	std::vector<EnemyData> frame_enemies;
-	uint8_t pawn_buf[PAWN_BUF_SIZE];
+	std::vector<uint8_t> bulk_buf;
 
 	while (state.running) {
-		uint64_t entity_list = driver::read_memory<uint64_t>(driver_handle, base + OFF_ENTITY_LIST);
-		uint64_t local_pawn = driver::read_memory<uint64_t>(driver_handle, base + OFF_LOCAL_PLAYER);
-		view_matrix_t vm = driver::read_memory<view_matrix_t>(driver_handle, base + OFF_VIEW_MATRIX);
+		// Phase 1: globals (3 reads → 1 IOCTL)
+		struct { uint64_t entity_list; uint64_t local_pawn; view_matrix_t vm; } globals = {};
+		{
+			driver::ReadEntry entries[] = {
+				{ base + OFF_ENTITY_LIST, sizeof(uint64_t) },
+				{ base + OFF_LOCAL_PLAYER, sizeof(uint64_t) },
+				{ base + OFF_VIEW_MATRIX, sizeof(view_matrix_t) },
+			};
+			driver::read_batch(driver_handle, entries, 3, &globals, sizeof(globals));
+		}
 
 		frame_enemies.clear();
 
-		if (entity_list && local_pawn) {
-			int local_team = driver::read_memory<int>(driver_handle, local_pawn + OFF_TEAM);
+		if (globals.entity_list && globals.local_pawn) {
+			// Phase 2: chunk pointers + local team (5 reads → 1 IOCTL)
+			struct { uint64_t chunks[4]; int local_team; } phase2 = {};
+			{
+				driver::ReadEntry entries[] = {
+					{ globals.entity_list + 8 * 0 + 16, sizeof(uint64_t) },
+					{ globals.entity_list + 8 * 1 + 16, sizeof(uint64_t) },
+					{ globals.entity_list + 8 * 2 + 16, sizeof(uint64_t) },
+					{ globals.entity_list + 8 * 3 + 16, sizeof(uint64_t) },
+					{ globals.local_pawn + OFF_TEAM, sizeof(int) },
+				};
+				driver::read_batch(driver_handle, entries, 5, &phase2, sizeof(phase2));
+			}
 
-			uint64_t chunk_cache[4] = {};
-			bool     chunk_valid[4] = {};
+			// Phase 3: all 64 controller pointers (64 reads → 1 IOCTL)
+			uint64_t controllers[64] = {};
+			if (phase2.chunks[0]) {
+				driver::ReadEntry entries[64];
+				for (int i = 0; i < 64; i++)
+					entries[i] = { phase2.chunks[0] + 0x70 * (uint64_t)(i + 1), sizeof(uint64_t) };
+				driver::read_batch(driver_handle, entries, 64, controllers, sizeof(controllers));
+			}
 
-			auto get_chunk = [&](uint32_t ci) -> uint64_t {
-				if (ci >= 4) return 0;
-				if (!chunk_valid[ci]) {
-					chunk_cache[ci] = driver::read_memory<uint64_t>(driver_handle, entity_list + 8 * ci + 16);
-					chunk_valid[ci] = true;
+			// Phase 4: pawn handles for valid controllers (≤64 reads → 1 IOCTL)
+			uint32_t pawn_handles[64] = {};
+			int valid_ctrl[64];
+			int valid_ctrl_n = 0;
+
+			for (int i = 0; i < 64; i++) {
+				if (controllers[i])
+					valid_ctrl[valid_ctrl_n++] = i;
+			}
+
+			if (valid_ctrl_n > 0) {
+				driver::ReadEntry entries[64];
+				for (int i = 0; i < valid_ctrl_n; i++)
+					entries[i] = { controllers[valid_ctrl[i]] + OFF_PLAYER_PAWN, sizeof(uint32_t) };
+
+				uint32_t results[64] = {};
+				driver::read_batch(driver_handle, entries, valid_ctrl_n, results, valid_ctrl_n * sizeof(uint32_t));
+
+				for (int i = 0; i < valid_ctrl_n; i++)
+					pawn_handles[valid_ctrl[i]] = results[i];
+			}
+
+			// Phase 5: resolve pawn entity pointers (≤64 reads → 1 IOCTL)
+			uint64_t pawns[64] = {};
+			int pawn_slots[64];
+			int pawn_slot_n = 0;
+
+			for (int i = 0; i < 64; i++) {
+				if (!pawn_handles[i]) continue;
+				uint32_t idx = pawn_handles[i] & 0x7FFF;
+				uint32_t ci = idx >> 9;
+				if (ci >= 4 || !phase2.chunks[ci]) continue;
+				pawn_slots[pawn_slot_n++] = i;
+			}
+
+			if (pawn_slot_n > 0) {
+				driver::ReadEntry entries[64];
+				for (int i = 0; i < pawn_slot_n; i++) {
+					uint32_t idx = pawn_handles[pawn_slots[i]] & 0x7FFF;
+					uint32_t ci = idx >> 9;
+					entries[i] = { phase2.chunks[ci] + 0x70 * (uint64_t)(idx & 0x1FF), sizeof(uint64_t) };
 				}
-				return chunk_cache[ci];
-			};
 
-			auto get_entity = [&](uint32_t idx) -> uint64_t {
-				uint64_t chunk = get_chunk(idx >> 9);
-				if (!chunk) return 0;
-				return driver::read_memory<uint64_t>(driver_handle, chunk + 0x70 * (idx & 0x1FF));
-			};
+				uint64_t results[64] = {};
+				driver::read_batch(driver_handle, entries, pawn_slot_n, results, pawn_slot_n * sizeof(uint64_t));
 
-			for (int i = 1; i <= 64; i++) {
-				uint64_t controller = get_entity(i);
-				if (!controller) continue;
+				for (int i = 0; i < pawn_slot_n; i++)
+					pawns[pawn_slots[i]] = results[i];
+			}
 
-				uint32_t pawn_handle = driver::read_memory<uint32_t>(driver_handle, controller + OFF_PLAYER_PAWN);
-				uint64_t pawn = get_entity(pawn_handle & 0x7FFF);
-				if (!pawn || pawn == local_pawn) continue;
+			// Phase 6: bulk pawn data for enemy pawns (≤64 reads → 1 IOCTL)
+			int enemy_slots[64];
+			int enemy_n = 0;
 
-				if (!driver::read_raw(driver_handle, pawn + PAWN_READ_START, pawn_buf, PAWN_BUF_SIZE))
-					continue;
+			for (int i = 0; i < 64; i++) {
+				if (pawns[i] && pawns[i] != globals.local_pawn)
+					enemy_slots[enemy_n++] = i;
+			}
 
-				int team = *(int*)(pawn_buf + OFF_TEAM - PAWN_READ_START);
-				if (team == local_team) continue;
+			if (enemy_n > 0) {
+				driver::ReadEntry entries[64];
+				for (int i = 0; i < enemy_n; i++)
+					entries[i] = { pawns[enemy_slots[i]] + PAWN_READ_START, PAWN_BUF_SIZE };
 
-				uint8_t life = *(uint8_t*)(pawn_buf + OFF_LIFE_STATE - PAWN_READ_START);
-				if (life != 0) continue;
+				bulk_buf.resize(enemy_n * PAWN_BUF_SIZE);
+				driver::read_batch(driver_handle, entries, enemy_n, bulk_buf.data(), bulk_buf.size());
 
-				int hp = *(int*)(pawn_buf + OFF_HEALTH - PAWN_READ_START);
-				if (hp <= 0) continue;
+				for (int i = 0; i < enemy_n; i++) {
+					const uint8_t* pawn_buf = bulk_buf.data() + i * PAWN_BUF_SIZE;
 
-				vec3 feet = *(vec3*)(pawn_buf + OFF_V_OLD_ORIGIN - PAWN_READ_START);
-				vec3 head = { feet.x, feet.y, feet.z + 72.0f };
-				frame_enemies.push_back({ feet, head, hp });
+					int team = *reinterpret_cast<const int*>(pawn_buf + OFF_TEAM - PAWN_READ_START);
+					if (team == phase2.local_team) continue;
+
+					uint8_t life = *(pawn_buf + OFF_LIFE_STATE - PAWN_READ_START);
+					if (life != 0) continue;
+
+					int hp = *reinterpret_cast<const int*>(pawn_buf + OFF_HEALTH - PAWN_READ_START);
+					if (hp <= 0) continue;
+
+					vec3 feet = *reinterpret_cast<const vec3*>(pawn_buf + OFF_V_OLD_ORIGIN - PAWN_READ_START);
+					vec3 head = { feet.x, feet.y, feet.z + 72.0f };
+					frame_enemies.push_back({ feet, head, hp });
+				}
 			}
 		}
 
 		{
 			std::lock_guard<std::mutex> lock(state.mtx);
 			std::swap(state.enemies, frame_enemies);
-			state.view_matrix = vm;
+			state.view_matrix = globals.vm;
 		}
+
+		Sleep(2);
 	}
 
 	CloseHandle(driver_handle);

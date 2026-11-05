@@ -87,6 +87,56 @@ namespace driver {
 
 		const ULONG in_len = stack_irp->Parameters.DeviceIoControl.InputBufferLength;
 		const ULONG out_len = stack_irp->Parameters.DeviceIoControl.OutputBufferLength;
+		const ULONG control_code = stack_irp->Parameters.DeviceIoControl.IoControlCode;
+
+		if (control_code == codes::read_batch) {
+			if (target_process == nullptr) {
+				status = STATUS_DEVICE_NOT_READY;
+			} else if (irp->AssociatedIrp.SystemBuffer == nullptr || in_len < sizeof(BatchRequest)) {
+				status = STATUS_INVALID_PARAMETER;
+			} else {
+				auto* batch_in = reinterpret_cast<BatchRequest*>(irp->AssociatedIrp.SystemBuffer);
+				const ULONG count = batch_in->count;
+
+				if (count == 0 || count > kMaxBatchEntries) {
+					status = STATUS_INVALID_PARAMETER;
+				} else {
+					BatchEntry local_entries[kMaxBatchEntries];
+					RtlCopyMemory(local_entries, batch_in->entries, count * sizeof(BatchEntry));
+
+					SIZE_T total_size = 0;
+					for (ULONG i = 0; i < count; i++)
+						total_size += local_entries[i].size;
+
+					if (out_len < total_size) {
+						status = STATUS_BUFFER_TOO_SMALL;
+					} else {
+						auto* out = reinterpret_cast<PUCHAR>(irp->AssociatedIrp.SystemBuffer);
+						SIZE_T offset = 0;
+						status = STATUS_SUCCESS;
+
+						for (ULONG i = 0; i < count; i++) {
+							SIZE_T ret = 0;
+							NTSTATUS rs = MmCopyVirtualMemory(
+								target_process, local_entries[i].target,
+								PsGetCurrentProcess(), out + offset,
+								local_entries[i].size, KernelMode, &ret);
+							if (!NT_SUCCESS(rs))
+								RtlZeroMemory(out + offset, local_entries[i].size);
+							offset += local_entries[i].size;
+						}
+
+						irp->IoStatus.Information = offset;
+					}
+				}
+			}
+
+			irp->IoStatus.Status = status;
+			if (!NT_SUCCESS(status)) irp->IoStatus.Information = 0;
+			IoCompleteRequest(irp, IO_NO_INCREMENT);
+			return status;
+		}
+
 		auto request = reinterpret_cast<Request*>(irp->AssociatedIrp.SystemBuffer);
 
 		if (request == nullptr || in_len < sizeof(Request) || out_len < sizeof(Request)) {
@@ -95,8 +145,6 @@ namespace driver {
 			IoCompleteRequest(irp, IO_NO_INCREMENT);
 			return STATUS_INVALID_PARAMETER;
 		}
-
-		const ULONG control_code = stack_irp->Parameters.DeviceIoControl.IoControlCode;
 
 		switch (control_code) {
 			case codes::attach: {

@@ -54,4 +54,26 @@ namespace driver {
 		}
 		return reinterpret_cast<std::uintptr_t>(r.module_base);
 	}
+
+	struct ReadEntry {
+		std::uintptr_t addr;
+		std::size_t size;
+	};
+
+	inline bool read_batch(HANDLE driver_handle, const ReadEntry* entries, std::size_t count,
+	                        void* out, std::size_t out_size) {
+		if (count == 0 || count > kMaxBatchEntries) return false;
+
+		BatchRequest req = {};
+		req.count = static_cast<ULONG>(count);
+		for (std::size_t i = 0; i < count; i++) {
+			req.entries[i].target = reinterpret_cast<PVOID>(entries[i].addr);
+			req.entries[i].size = entries[i].size;
+		}
+
+		return DeviceIoControl(driver_handle, codes::read_batch,
+		                       &req, sizeof(req),
+		                       out, static_cast<DWORD>(out_size),
+		                       nullptr, nullptr) == TRUE;
+	}
 }

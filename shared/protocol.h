@@ -12,6 +12,7 @@ namespace driver {
 		constexpr ULONG read = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x697, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 		constexpr ULONG write = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x698, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 		constexpr ULONG get_module_base = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x699, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+		constexpr ULONG read_batch = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x69A, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 	}
 
 	constexpr SIZE_T kMaxModuleNameChars = 64;
@@ -24,5 +25,17 @@ namespace driver {
 		SIZE_T return_size;
 		wchar_t module_name[kMaxModuleNameChars];
 		PVOID module_base;
+	};
+
+	constexpr ULONG kMaxBatchEntries = 64;
+
+	struct BatchEntry {
+		PVOID target;
+		SIZE_T size;
+	};
+
+	struct BatchRequest {
+		ULONG count;
+		BatchEntry entries[kMaxBatchEntries];
 	};
 }
